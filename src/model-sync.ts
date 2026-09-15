@@ -19,6 +19,8 @@ export interface ModelEntry {
     input: string[]
     output: string[]
   }
+  reasoningEfforts?: string[]
+  variants?: Record<string, Record<string, unknown>>
   cost: { input: number; output: number; cache_read?: number; cache_write?: number }
   limit: { context: number; output: number }
 }
@@ -104,8 +106,9 @@ function findCliMjs(): string | null {
   return null
 }
 
-function extractModalitiesMap(): Map<string, string[]> {
-  const map = new Map<string, string[]>()
+function extractCliMetadata(): { modalities: Map<string, string[]>; efforts: Map<string, string[]> } {
+  const modalities = new Map<string, string[]>()
+  const efforts = new Map<string, string[]>()
   try {
     const cliPath = findCliMjs()
     if (cliPath && existsSync(cliPath)) {
@@ -113,18 +116,29 @@ function extractModalitiesMap(): Map<string, string[]> {
       const m = content.match(/(\$L=\{[^;]+);/)
       if (m) {
         const text = m[1].replace(/^\$L=/, "")
-        const regex = /id:\s*"([^"]+)"[^{}]*?inputModalities:\s*(\[[^\]]*\])/g
+        const regex = /id:\s*"([^"]+)"/g
         let match: RegExpExecArray | null
         while ((match = regex.exec(text)) !== null) {
-          try {
-            const rawArr = match[2].replace(/'/g, '"')
-            map.set(match[1].toLowerCase(), JSON.parse(rawArr))
-          } catch {}
+          const id = match[1].toLowerCase()
+          const start = match.index
+          const slice = text.slice(start, start + 350)
+          const modMatch = slice.match(/inputModalities:\s*(\[[^\]]*\])/)
+          if (modMatch) {
+            try {
+              modalities.set(id, JSON.parse(modMatch[1].replace(/'/g, '"')))
+            } catch {}
+          }
+          const effMatch = slice.match(/reasoningEfforts:\s*(\[[^\]]*\])/)
+          if (effMatch) {
+            try {
+              efforts.set(id, JSON.parse(effMatch[1].replace(/'/g, '"')))
+            } catch {}
+          }
         }
       }
     }
   } catch {}
-  return map
+  return { modalities, efforts }
 }
 
 function isVisionModelFallback(id: string): boolean {
@@ -167,7 +181,7 @@ function parseCost(raw: string): ModelEntry["cost"] | null {
 
 export function parseModelsMd(text: string, hints: Map<string, ModelEntry>): ModelEntry[] {
   const entries: ModelEntry[] = []
-  const modalitiesMap = extractModalitiesMap()
+  const { modalities: modalitiesMap, efforts: effortsMap } = extractCliMetadata()
   let section = ""
   for (const line of text.split(/\r?\n/)) {
     const heading = /^##\s+(.+?)\s*$/.exec(line)
@@ -184,11 +198,30 @@ export function parseModelsMd(text: string, hints: Map<string, ModelEntry>): Mod
     if (!id) continue
     const hint = hints.get(id.toLowerCase())
     const context = parseContext(cells[2]) ?? (hint?.limit.context || 200000)
-    const efforts = cells[3]
     const cost = parseCost(cells[4]) ?? hint?.cost ?? { input: 0, output: 0 }
     const minPlan = cells[5] ? cells[5].trim() : ""
     const planBadge = minPlan ? ` [${minPlan.replace(" and above", "+")}]` : ""
     const displayName = `${cells[1]}${planBadge}`
+
+    // Dynamically resolve reasoning efforts from vendor CLI catalog ($L in cli.mjs) or models.md
+    const rawEfforts = cells[3]?.trim()
+    let effortsList: string[] = []
+    if (rawEfforts && rawEfforts !== "—" && rawEfforts !== "-") {
+      effortsList = rawEfforts.split(",").map((s) => s.trim()).filter(Boolean)
+    }
+    const cliEfforts = effortsMap.get(id.toLowerCase())
+    if (cliEfforts && cliEfforts.length > 0) {
+      effortsList = cliEfforts
+    }
+
+    const variants: Record<string, Record<string, unknown>> = {}
+    for (const effort of effortsList) {
+      variants[effort] = {
+        reasoning_effort: effort,
+        reasoningEffort: effort,
+        effort: effort,
+      }
+    }
 
     const cliMods = modalitiesMap.get(id.toLowerCase())
     const hasVision = cliMods ? cliMods.includes("image") : isVisionModelFallback(id)
@@ -198,7 +231,9 @@ export function parseModelsMd(text: string, hints: Map<string, ModelEntry>): Mod
       id,
       name: displayName,
       tier: section.toLowerCase() === "open source" ? "open-source" : "premium",
-      reasoning: efforts !== "" && efforts !== "—" && efforts !== "-",
+      reasoning: effortsList.length > 0,
+      reasoningEfforts: effortsList.length > 0 ? effortsList : undefined,
+      variants: Object.keys(variants).length > 0 ? variants : undefined,
       tool_call: true,
       attachment: inputMods.some((m) => m !== "text"),
       modalities: {

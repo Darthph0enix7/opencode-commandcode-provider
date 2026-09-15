@@ -59,6 +59,7 @@ interface CCRequestEnvelope {
     temperature?: number
     top_p?: number
     top_k?: number
+    reasoning_effort?: string
   }
 }
 
@@ -220,6 +221,38 @@ function convertTools(
     }))
 }
 
+function extractReasoningEffort(options: LanguageModelV3CallOptions): string | undefined {
+  const opt = options as Record<string, unknown>
+  if (typeof opt.reasoning_effort === "string") return opt.reasoning_effort
+  if (typeof opt.reasoningEffort === "string") return opt.reasoningEffort
+  if (typeof opt.effort === "string") return opt.effort
+  if (typeof opt.variant === "string") return opt.variant
+
+  if (opt.providerOptions && typeof opt.providerOptions === "object") {
+    const po = opt.providerOptions as Record<string, unknown>
+    for (const key of Object.keys(po)) {
+      const val = po[key]
+      if (val && typeof val === "object") {
+        const sub = val as Record<string, unknown>
+        if (typeof sub.reasoning_effort === "string") return sub.reasoning_effort
+        if (typeof sub.reasoningEffort === "string") return sub.reasoningEffort
+        if (typeof sub.effort === "string") return sub.effort
+        if (typeof sub.variant === "string") return sub.variant
+      }
+    }
+  }
+
+  if (opt.options && typeof opt.options === "object") {
+    const sub = opt.options as Record<string, unknown>
+    if (typeof sub.reasoning_effort === "string") return sub.reasoning_effort
+    if (typeof sub.reasoningEffort === "string") return sub.reasoningEffort
+    if (typeof sub.effort === "string") return sub.effort
+    if (typeof sub.variant === "string") return sub.variant
+  }
+
+  return undefined
+}
+
 export function buildRequest(
   modelId: string,
   options: LanguageModelV3CallOptions,
@@ -236,6 +269,8 @@ export function buildRequest(
     if (converted) messages.push(converted)
   }
 
+  const effort = extractReasoningEffort(options)
+
   const params: CCRequestEnvelope["params"] = {
     model: modelId,
     messages,
@@ -243,6 +278,7 @@ export function buildRequest(
     system: systemPrompt,
     max_tokens: options.maxOutputTokens ?? 16384,
     stream: true,
+    ...(effort ? { reasoning_effort: effort } : {}),
   }
 
   if (options.temperature !== undefined) params.temperature = options.temperature

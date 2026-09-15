@@ -36,6 +36,7 @@ export default async function commandcodePlugin() {
             tool_call: entry.tool_call,
             attachment: entry.attachment ?? (entry.modalities?.input?.some((m) => m !== "text") ?? false),
             modalities: entry.modalities ?? { input: ["text"], output: ["text"] },
+            variants: entry.variants,
             cost: costObj,
             limit: entry.limit,
           }
