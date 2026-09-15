@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "fs"
+import { existsSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from "fs"
 import { dirname, join } from "path"
 import { fileURLToPath } from "url"
 import { resolveApiKey } from "./auth.js"
@@ -55,6 +55,11 @@ function writeAtomic(file: string, data: string) {
 // Locate the model catalog bundled with the installed Command Code CLI.
 // The catalog is the vendor-maintained list for the same API endpoint this
 // provider talks to, so it is the most accurate metadata source available.
+function bundledMdIn(root: string): string | null {
+  const candidate = join(root, "command-code", "dist", "bundled", "command-code-knowledge", "reference", "models.md")
+  return existsSync(candidate) ? candidate : null
+}
+
 function findModelsMd(): string | null {
   const explicit = process.env.COMMANDCODE_MODELS_MD
   if (explicit && existsSync(explicit)) return explicit
@@ -79,6 +84,28 @@ function findModelsMd(): string | null {
         if (existsSync(candidate)) return candidate
       }
     }
+  }
+
+  // Common global npm roots — PATH-independent so background services
+  // (OpenChamber, launchd/systemd) resolve the catalog even when the npm
+  // global bin dir is not exported into their environment.
+  const roots: string[] = []
+  const home = process.env.HOME
+  if (home) {
+    for (const base of [join(home, ".local", "share", "nvm"), join(home, ".nvm", "versions", "node"), join(home, ".npm-global", "lib")]) {
+      try {
+        for (const version of readdirSync(base)) {
+          roots.push(join(base, version, "lib", "node_modules"))
+        }
+      } catch {
+        // directory absent — skip
+      }
+    }
+  }
+  roots.push("/usr/local/lib/node_modules", "/usr/lib/node_modules", "/opt/homebrew/lib/node_modules")
+  for (const root of roots) {
+    const found = bundledMdIn(root)
+    if (found) return found
   }
   return null
 }
@@ -247,6 +274,34 @@ export function parseModelsMd(text: string, hints: Map<string, ModelEntry>): Mod
   return entries
 }
 
+// Server-managed master catalog. The server (keypool) serves the same
+// enriched model list this provider builds locally, so clients fetch it at
+// startup and always see current models/capabilities — no plugin update and
+// no `op pull` needed when the catalog changes.
+export async function fetchRemoteCatalog(url: string, timeoutMs = 1500): Promise<ModelEntry[] | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, { signal: controller.signal, headers: { accept: "application/json" } })
+    if (!response.ok) return null
+    const payload = (await response.json()) as unknown
+    const list = Array.isArray(payload)
+      ? payload
+      : payload && typeof payload === "object" && Array.isArray((payload as { models?: unknown }).models)
+        ? (payload as { models: unknown[] }).models
+        : null
+    if (!list) return null
+    const entries = list.filter(
+      (entry): entry is ModelEntry => typeof entry === "object" && entry !== null && typeof (entry as { id?: unknown }).id === "string",
+    )
+    return entries.length >= 5 ? entries : null
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function fetchApiModels(): Promise<ApiModel[] | null> {
   const apiKey = resolveApiKey({})
   const controller = new AbortController()
@@ -311,44 +366,68 @@ function mergeApiModels(entries: ModelEntry[], api: ApiModel[], hints?: Map<stri
 }
 
 // Build the model list fresh on every opencode instance start:
-//   1. CLI-bundled catalog (vendor-maintained, refreshed by `cmd update`)
-//   2. Command Code's public model endpoint (picks up brand-new models)
-//   3. last synced cache, then the bundled snapshot as an offline fallback.
-export async function loadSyncedModels(): Promise<SyncResult> {
+//   1. REMOTE master catalog (server-managed; always current — primary source
+//      so client devices never depend on a local CLI install for metadata)
+//   2. local CLI-bundled catalog + Command Code's public model endpoint
+//      (used to append models newer than the server catalog, and as the
+//      offline fallback when the server is unreachable)
+//   3. last synced cache, then the bundled snapshot as a final fallback.
+export async function loadSyncedModels(options?: { catalogUrl?: string }): Promise<SyncResult> {
   const bundled = loadCachedModels(BUNDLED_MODELS)
   const cached = loadCachedModels(CACHE_MODELS)
   const hints = new Map<string, ModelEntry>()
   for (const entry of [...(cached ?? []), ...(bundled ?? [])]) hints.set(entry.id.toLowerCase(), entry)
 
-  let docModels: ModelEntry[] | null = null
+  let localModels: ModelEntry[] | null = null
+  let localSource = ""
   try {
     const modelsMd = findModelsMd()
     if (modelsMd) {
       const parsed = parseModelsMd(readFileSync(modelsMd, "utf-8"), hints)
-      if (parsed.length >= 5) docModels = parsed
+      if (parsed.length >= 5) {
+        const apiModels = await fetchApiModels()
+        localModels = mergeApiModels(parsed, apiModels ?? [], hints)
+        localSource = apiModels?.length ? "cli-catalog+api" : "cli-catalog"
+      }
     }
   } catch {
-    // intentionally silent: fall through to the API or cache
+    // intentionally silent: fall through to the API or remote catalog
   }
-
-  const apiModels = await fetchApiModels()
+  if (!localModels?.length) {
+    const apiModels = await fetchApiModels()
+    if (apiModels?.length) {
+      localModels = mergeApiModels([], apiModels, hints)
+      localSource = "api"
+    }
+  }
 
   let models: ModelEntry[] | null = null
   let source = ""
-  if (docModels?.length) {
-    models = mergeApiModels(docModels, apiModels ?? [], hints)
-    source = apiModels?.length ? "cli-catalog+api" : "cli-catalog"
-  } else if (apiModels?.length) {
-    models = mergeApiModels([], apiModels, hints)
-    source = "api"
+  if (options?.catalogUrl) {
+    const remote = await fetchRemoteCatalog(options.catalogUrl)
+    if (remote) {
+      models = remote
+      source = "remote"
+      if (localModels?.length) {
+        const seen = new Set(remote.map((entry) => entry.id.toLowerCase()))
+        const extra = localModels.filter((entry) => !seen.has(entry.id.toLowerCase()))
+        if (extra.length) {
+          models = [...remote, ...extra]
+          source = "remote+local"
+        }
+      }
+    }
   }
-
+  if (!models?.length && localModels?.length) {
+    models = localModels
+    source = localSource
+  }
   if (!models?.length) {
     models = cached ?? bundled ?? []
     source = cached ? "cache" : "bundled"
   }
 
-  if (!models.length) throw new Error("Command Code model catalog unavailable (no CLI, API, cache, or bundled list)")
+  if (!models.length) throw new Error("Command Code model catalog unavailable (no remote, CLI, API, cache, or bundled list)")
 
   if (source !== "cache" && source !== "bundled") {
     try {
@@ -356,6 +435,10 @@ export async function loadSyncedModels(): Promise<SyncResult> {
     } catch {
       // intentionally silent: cache is best-effort
     }
+  }
+
+  if (process.env.COMMANDCODE_DEBUG) {
+    console.warn(`[commandcode] catalog source=${source} models=${models.length}`)
   }
 
   return { models, source }

@@ -21,7 +21,18 @@ export default async function commandcodePlugin() {
       if (!cc.env) cc.env = ["COMMANDCODE_API_KEY"]
 
       if (!cc.models) {
-        const { models } = await loadSyncedModels()
+        const options = (cc.options as Record<string, unknown> | undefined) ?? {}
+        const baseURL = typeof options.baseURL === "string" ? options.baseURL.replace(/\/+$/, "") : undefined
+        const catalogUrl =
+          typeof options.catalogUrl === "string"
+            ? options.catalogUrl
+            : baseURL
+              ? `${baseURL}/catalog.json`
+              : undefined
+        const { models, source } = await loadSyncedModels({ catalogUrl })
+        if (process.env.COMMANDCODE_DEBUG) {
+          console.warn(`[commandcode] injected ${models.length} models from ${source}`)
+        }
         const modelsObj: Record<string, unknown> = {}
         for (const entry of models) {
           const key = toConfigKey(entry.id)
