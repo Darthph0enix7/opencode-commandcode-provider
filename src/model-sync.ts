@@ -266,7 +266,7 @@ async function fetchApiModels(): Promise<ApiModel[] | null> {
   }
 }
 
-function mergeApiModels(entries: ModelEntry[], api: ApiModel[]): ModelEntry[] {
+function mergeApiModels(entries: ModelEntry[], api: ApiModel[], hints?: Map<string, ModelEntry>): ModelEntry[] {
   const seen = new Map(entries.map((entry) => [entry.id.toLowerCase(), entry]))
   for (const model of api) {
     if (!model?.id) continue
@@ -278,15 +278,32 @@ function mergeApiModels(entries: ModelEntry[], api: ApiModel[]): ModelEntry[] {
       }
       continue
     }
-    const entry: ModelEntry = {
-      id: model.id,
-      name: model.name?.trim() || model.id.split("/").pop() || model.id,
-      tier: "open-source",
-      reasoning: true,
-      tool_call: true,
-      cost: { input: 0, output: 0 },
-      limit: { context: model.context_length && model.context_length > 0 ? model.context_length : 200000, output: 65536 },
-    }
+    // Prefer the bundled snapshot's metadata (plan badge, variants, vision) so
+    // machines without the CLI catalog still get full capabilities.
+    const hint = hints?.get(key)
+    const entry: ModelEntry = hint
+      ? {
+          ...hint,
+          modalities: hint.modalities ? { input: [...hint.modalities.input], output: [...hint.modalities.output] } : undefined,
+          variants: hint.variants ? { ...hint.variants } : undefined,
+          reasoningEfforts: hint.reasoningEfforts ? [...hint.reasoningEfforts] : undefined,
+          limit: {
+            context:
+              model.context_length && model.context_length > 0
+                ? model.context_length
+                : hint.limit.context,
+            output: hint.limit.output,
+          },
+        }
+      : {
+          id: model.id,
+          name: model.name?.trim() || model.id.split("/").pop() || model.id,
+          tier: "open-source",
+          reasoning: true,
+          tool_call: true,
+          cost: { input: 0, output: 0 },
+          limit: { context: model.context_length && model.context_length > 0 ? model.context_length : 200000, output: 65536 },
+        }
     entries.push(entry)
     seen.set(key, entry)
   }
@@ -319,10 +336,10 @@ export async function loadSyncedModels(): Promise<SyncResult> {
   let models: ModelEntry[] | null = null
   let source = ""
   if (docModels?.length) {
-    models = mergeApiModels(docModels, apiModels ?? [])
+    models = mergeApiModels(docModels, apiModels ?? [], hints)
     source = apiModels?.length ? "cli-catalog+api" : "cli-catalog"
   } else if (apiModels?.length) {
-    models = mergeApiModels([], apiModels)
+    models = mergeApiModels([], apiModels, hints)
     source = "api"
   }
 
