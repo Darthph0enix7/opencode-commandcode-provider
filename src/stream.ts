@@ -1,4 +1,5 @@
 import type { LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
+import { appendFileSync } from "fs"
 
 type RawEvent = Record<string, unknown> & { type: string }
 
@@ -84,10 +85,30 @@ function toStreamPart(event: RawEvent): LanguageModelV3StreamPart | null {
     case "finish-step": {
       const usage = event.usage ?? event.totalUsage ?? {}
       const rawReason = (event.finishReason ?? event.rawFinishReason ?? "stop") as string
+      const mapped = mapUsage(typeof usage === "object" && usage !== null ? (usage as Record<string, unknown>) : {})
+      // Opt-in usage accounting: COMMANDCODE_DEBUG_USAGE=/path/to/usage.jsonl
+      // appends one line per completed step (used to prove image token costs).
+      const usageLogPath = process.env.COMMANDCODE_DEBUG_USAGE
+      if (usageLogPath) {
+        try {
+          appendFileSync(
+            usageLogPath,
+            JSON.stringify({
+              ts: new Date().toISOString(),
+              inputTokens: mapped.inputTokens,
+              outputTokens: mapped.outputTokens,
+              finishReason: rawReason,
+            }) + "\n",
+            "utf-8",
+          )
+        } catch {
+          // diagnostics only
+        }
+      }
       return {
         type: "finish",
         finishReason: { unified: mapFinishReason(rawReason), raw: rawReason },
-        usage: mapUsage(typeof usage === "object" && usage !== null ? (usage as Record<string, unknown>) : {}),
+        usage: mapped,
       }
     }
 

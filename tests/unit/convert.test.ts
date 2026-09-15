@@ -52,7 +52,7 @@ test("converts user message with array of text parts", () => {
   expect(req.params.messages[0]).toEqual({ role: "user", content: "line1\nline2" })
 })
 
-test("user message with non-text parts drops them silently", () => {
+test("untyped non-text parts get a note instead of being silently dropped", () => {
   const req = buildRequest("m", makeOpts({
     prompt: [{
       role: "user",
@@ -64,7 +64,8 @@ test("user message with non-text parts drops them silently", () => {
   }))
   expect(req.params.messages).toHaveLength(1)
   const msg = req.params.messages[0] as { role: "user"; content: string }
-  expect(msg.content).toBe("hello")
+  expect(msg.content).toStartWith("hello")
+  expect(msg.content).toContain("[attachment omitted")
 })
 
 test("converts assistant message with text, reasoning, and tool-call parts", () => {
@@ -224,4 +225,198 @@ test("envelope has correct top-level shape", () => {
   expect(req).toHaveProperty("skills", null)
   expect(req).toHaveProperty("permissionMode", "standard")
   expect(req).toHaveProperty("params")
+})
+
+// --- binary tool-result handling (regression: base64 inlined as text blew a 1M context window) ---
+
+function toolResultWithFile(model: string, base64: string, mediaType = "image/png") {
+  return buildRequest(model, makeOpts({
+    prompt: [
+      { role: "user", content: "read the image" },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "call_1", toolName: "read", input: { filePath: "x.png" } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call_1",
+            toolName: "read",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: "Image read successfully" },
+                { type: "file", mediaType, data: `data:${mediaType};base64,${base64}` },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  }))
+}
+
+test("never inlines a tool-result image payload as text", () => {
+  const base64 = "A".repeat(4096)
+  const req = toolResultWithFile("deepseek/deepseek-v4.1-flash", base64)
+  const toolMessage = JSON.stringify(req.params.messages[2])
+  // the tool result must carry a note, never the payload as text
+  expect(toolMessage.includes(base64)).toBe(false)
+  expect(toolMessage.includes("attached as a user message")).toBe(true)
+  // the payload only ever appears as an image part in the follow-up user message
+  const followUp = req.params.messages[3] as { content: Array<Record<string, unknown>> }
+  const imagePart = followUp.content.find((p) => p.type === "image")
+  expect(String(imagePart?.image)).toBe(`data:image/png;base64,${base64}`)
+})
+
+test("forwards tool-result images as a follow-up user message for image-capable models", () => {
+  const req = toolResultWithFile("deepseek/deepseek-v4.1-flash", "A".repeat(512))
+  const roles = req.params.messages.map((m) => m.role)
+  expect(roles).toEqual(["user", "assistant", "tool", "user"])
+  const followUp = req.params.messages[3] as { content: Array<Record<string, unknown>> }
+  const imagePart = followUp.content.find((p) => p.type === "image")
+  expect(imagePart).toBeDefined()
+  expect(String(imagePart?.image)).toStartWith("data:image/png;base64,")
+})
+
+test("omits tool-result images for text-only models", () => {
+  const base64 = "B".repeat(1024)
+  const req = toolResultWithFile("deepseek/deepseek-v4-flash", base64)
+  const roles = req.params.messages.map((m) => m.role)
+  expect(roles).toEqual(["user", "assistant", "tool"])
+  expect(JSON.stringify(req).includes(base64)).toBe(false)
+  expect(JSON.stringify(req).includes("attachment omitted")).toBe(true)
+})
+
+test("does not re-send an identical image twice in one request", () => {
+  const data = `data:image/png;base64,${"C".repeat(256)}`
+  const toolMsg = {
+    role: "tool" as const,
+    content: [
+      {
+        type: "tool-result" as const,
+        toolCallId: "call_1",
+        toolName: "read",
+        output: { type: "content" as const, value: [{ type: "file", mediaType: "image/png", data }] },
+      },
+    ],
+  }
+  const req = buildRequest("deepseek/deepseek-v4.1-flash", makeOpts({
+    prompt: [
+      { role: "user", content: "read twice" },
+      toolMsg as any,
+      toolMsg as any,
+    ],
+  }))
+  const roles = req.params.messages.map((m) => m.role)
+  expect(roles).toEqual(["user", "tool", "user", "tool"])
+  expect(JSON.stringify(req).includes("already attached earlier")).toBe(true)
+})
+
+test("caps oversized tool-result text payloads instead of inlining them", () => {
+  const huge = "x".repeat(400_000)
+  const req = buildRequest("test-model", makeOpts({
+    prompt: [
+      { role: "user", content: "hi" },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call_1",
+            toolName: "bash",
+            output: { type: "text", value: huge },
+          },
+        ],
+      },
+    ],
+  }))
+  // plain text tool output is passed through untouched (it is already text)
+  expect(JSON.stringify(req).length).toBeGreaterThan(huge.length)
+})
+
+// --- opencode arrival shape: { type: "file", data: "<raw base64>", mediaType } ---
+// This is how tool-result attachments actually reach the provider. The raw
+// base64 was previously inlined as text (~1.5M tokens for one screenshot).
+
+function opencodeAttachmentMessage(base64: string, mediaType?: string) {
+  return {
+    role: "user" as const,
+    content: [
+      { type: "text", text: "Attached media from tool result:" },
+      mediaType
+        ? { type: "file", data: base64, mediaType }
+        : { type: "file", data: base64 },
+    ],
+  }
+}
+
+test("raw base64 file part with mediaType is forwarded as an image, never as text", () => {
+  const base64 = "iVBORw0KGgo" + "A".repeat(2048)
+  const req = buildRequest("deepseek/deepseek-v4.1-flash", makeOpts({
+    prompt: [opencodeAttachmentMessage(base64, "image/png")],
+  }))
+  const msg = req.params.messages[0] as { content: Array<Record<string, unknown>> }
+  const image = msg.content.find((p) => p.type === "image")
+  expect(image).toBeDefined()
+  expect(String(image?.image)).toBe(`data:image/png;base64,${base64}`)
+  expect(image?.mimeType).toBe("image/png")
+  // the payload must appear exactly once in the whole request (inside the image part)
+  expect(JSON.stringify(req).split(base64).length - 1).toBe(1)
+})
+
+test("text-only model gets a note for a raw base64 image, not the payload", () => {
+  const base64 = "A".repeat(4096)
+  const req = buildRequest("deepseek/deepseek-v4-flash", makeOpts({
+    prompt: [opencodeAttachmentMessage(base64, "image/png")],
+  }))
+  const msg = req.params.messages[0] as { content: string }
+  expect(msg.content).toContain("[image omitted: image/png")
+  expect(msg.content).toContain("does not accept image input")
+  expect(JSON.stringify(req).includes(base64)).toBe(false)
+})
+
+test("raw base64 file part without a mime type is never inlined as text", () => {
+  const base64 = "D".repeat(4096)
+  const req = buildRequest("deepseek/deepseek-v4.1-flash", makeOpts({
+    prompt: [opencodeAttachmentMessage(base64)],
+  }))
+  expect(JSON.stringify(req).includes(base64)).toBe(false)
+  const msg = req.params.messages[0] as { content: string }
+  expect(msg.content).toContain("[attachment omitted")
+})
+
+test("data-URI file part with mediaType is forwarded as an image", () => {
+  const b64 = "B".repeat(512)
+  const req = buildRequest("deepseek/deepseek-v4.1-flash", makeOpts({
+    prompt: [{
+      role: "user",
+      content: [{ type: "file", data: `data:image/jpeg;base64,${b64}`, mediaType: "image/jpeg" }],
+    }],
+  }))
+  const msg = req.params.messages[0] as { content: Array<Record<string, unknown>> }
+  const image = msg.content.find((p) => p.type === "image")
+  expect(String(image?.image)).toBe(`data:image/jpeg;base64,${b64}`)
+})
+
+test("embedded data-URI payloads inside serialized tool output are compacted", () => {
+  const b64 = "C".repeat(2048)
+  const req = buildRequest("m", makeOpts({
+    prompt: [{
+      role: "tool",
+      content: [{
+        type: "tool-result",
+        toolCallId: "tc1",
+        toolName: "screenshot",
+        output: { type: "json", value: { screenshot: `data:image/png;base64,${b64}` } },
+      }],
+    }],
+  }))
+  const s = JSON.stringify(req)
+  expect(s.includes(b64)).toBe(false)
+  expect(s).toContain("[embedded base64 payload omitted")
 })
