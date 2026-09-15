@@ -86,13 +86,62 @@ function extractText(content: unknown): string {
   if (typeof content === "string") return content
   if (Array.isArray(content)) {
     const textParts = content.filter(isTextPart) as LanguageModelV3TextPart[]
-    const nonTextParts = content.filter((p) => !isTextPart(p))
-    if (nonTextParts.length > 0 && textParts.length === 0) {
-      console.warn(`Command Code provider: dropped ${nonTextParts.length} non-text part(s) in user message`)
-    }
     return textParts.map((p) => p.text).join("\n")
   }
   return ""
+}
+
+function toDataUriOrUrl(data: string | Uint8Array | URL, defaultMime: string = "image/png"): string {
+  if (typeof data === "string") {
+    if (data.startsWith("data:") || data.startsWith("http://") || data.startsWith("https://")) {
+      return data
+    }
+    return `data:${defaultMime};base64,${data}`
+  }
+  if (data instanceof URL) {
+    return data.toString()
+  }
+  if (data instanceof Uint8Array || (typeof Buffer !== "undefined" && Buffer.isBuffer(data))) {
+    const b64 = Buffer.from(data).toString("base64")
+    return `data:${defaultMime};base64,${b64}`
+  }
+  return String(data)
+}
+
+function convertUserContent(content: unknown): string | Array<{ type: string; [key: string]: unknown }> {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+
+  const parts: Array<{ type: string; [key: string]: unknown }> = []
+  let hasMultimodal = false
+
+  for (const p of content) {
+    if (!p || typeof p !== "object") continue
+    const item = p as Record<string, unknown>
+
+    if (item.type === "text" && typeof item.text === "string") {
+      parts.push({ type: "text", text: item.text })
+    } else if (item.type === "image" && item.image) {
+      hasMultimodal = true
+      const mimeType = typeof item.mimeType === "string" ? item.mimeType : "image/png"
+      const imgUrl = toDataUriOrUrl(item.image as string | Uint8Array | URL, mimeType)
+      parts.push({ type: "image", image: imgUrl, mimeType })
+    } else if (item.type === "file" && item.data) {
+      const mimeType = typeof item.mimeType === "string" ? item.mimeType : "application/octet-stream"
+      if (mimeType.startsWith("image/")) {
+        hasMultimodal = true
+        const imgUrl = toDataUriOrUrl(item.data as string | Uint8Array | URL, mimeType)
+        parts.push({ type: "image", image: imgUrl, mimeType })
+      } else if (typeof item.data === "string" && !item.data.startsWith("data:")) {
+        parts.push({ type: "text", text: item.data })
+      }
+    }
+  }
+
+  if (!hasMultimodal) {
+    return parts.map((p) => (p.type === "text" ? String(p.text) : "")).join("\n")
+  }
+  return parts
 }
 
 function convertToolResultOutput(output: LanguageModelV3ToolResultOutput): CCToolResultContent["output"] {
@@ -117,8 +166,8 @@ function convertToolResultOutput(output: LanguageModelV3ToolResultOutput): CCToo
 function convertMessage(msg: LanguageModelV3Message): CCMessage | null {
   switch (msg.role) {
     case "user": {
-      const text = extractText(msg.content)
-      return { role: "user", content: text }
+      const content = convertUserContent(msg.content)
+      return { role: "user", content: content as any }
     }
     case "assistant": {
       const parts: CCAssistantContent[] = []

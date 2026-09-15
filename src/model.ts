@@ -12,7 +12,7 @@ import { parseStreamEvents } from "./stream.js"
 
 const DEFAULT_BASE_URL = "https://api.commandcode.ai"
 // x-command-code-version must match the Command Code CLI version for API compatibility
-const CC_VERSION = "0.26.20"
+const CC_VERSION = "1.54.0"
 
 export interface CommandCodeModelOptions {
   apiKey: string
